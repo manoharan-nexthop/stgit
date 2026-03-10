@@ -12,13 +12,13 @@ use std::{
 
 use anyhow::{Context, Result};
 use bstr::BStr;
-use clap::Arg;
+use clap::{Arg, ArgGroup};
 
 use crate::{
     argset,
     branchloc::BranchLocator,
     ext::{CommitExtended, RepositoryExtended},
-    patch::{patchrange, PatchRange, RangeConstraint},
+    patch::{patchrange, PatchName, PatchRange, RangeConstraint},
     stack::{InitializationPolicy, Stack, StackAccess, StackStateAccess},
     stupid::Stupid,
 };
@@ -118,7 +118,193 @@ fn make() -> clap::Command {
                 .conflicts_with("dir")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("no-series")
+                .long("no-series")
+                .short('N')
+                .help("Do not generate or update the series file")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("stdout"),
+        )
+        .arg(
+            Arg::new("update-series")
+                .long("update-series")
+                .short('U')
+                .help("Update existing series file instead of replacing it")
+                .long_help(
+                    "Update the existing series file by adding or updating entries for \
+                     the exported patches, rather than replacing the entire file. \
+                     Patches not being exported will remain in the series file."
+                )
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("stdout"),
+        )
+        .group(
+            ArgGroup::new("series-mode")
+                .args(["no-series", "update-series"])
+                .required(false),
+        )
+        .arg(
+            Arg::new("format-patch")
+                .long("format-patch")
+                .short('F')
+                .help("Use git format-patch style format")
+                .long_help(
+                    "Use git format-patch style format. This strips [PATCH] and similar \
+                     prefixes from the subject line and uses a format similar to \
+                     'git format-patch' output."
+                )
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("template"),
+        )
         .arg(argset::diff_opts_arg())
+}
+
+/// Update an existing series file by adding or updating entries for exported patches.
+fn update_series_file(
+    series_path: &Path,
+    patches: &[crate::patch::PatchName],
+    stack: &Stack,
+    numbered_flag: bool,
+    num_width: usize,
+    extension: &str,
+) -> Result<()> {
+    use std::collections::HashSet;
+
+    // Read existing series file if it exists
+    let existing_content = if series_path.exists() {
+        std::fs::read_to_string(series_path)
+            .with_context(|| format!("reading {series_path:?}"))?
+    } else {
+        String::new()
+    };
+
+    // Parse existing series file to preserve comments and non-exported patches
+    let mut lines: Vec<String> = Vec::new();
+    let mut existing_patches: HashSet<String> = HashSet::new();
+
+    for line in existing_content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            // Preserve all comments as-is (including base commit comment)
+            lines.push(line.to_string());
+        } else if !trimmed.is_empty() {
+            // Track existing patch entries
+            existing_patches.insert(trimmed.to_string());
+            lines.push(line.to_string());
+        }
+    }
+
+    // Build a map of patch names to their filenames
+    let mut patch_filenames: HashMap<String, String> = HashMap::new();
+    for (i, patchname) in patches.iter().enumerate() {
+        let patchfile_name = if numbered_flag {
+            let patch_number = i + 1;
+            format!("{patch_number:0num_width$}-{patchname}{extension}")
+        } else {
+            format!("{patchname}{extension}")
+        };
+        patch_filenames.insert(patchname.to_string(), patchfile_name);
+    }
+
+    // Build a set of patches being exported for quick lookup
+    let exported_patches: HashSet<String> = patches.iter().map(|p| p.to_string()).collect();
+
+    // Update or add entries for exported patches
+    let mut updated_lines: Vec<String> = Vec::new();
+    let mut processed_patches: HashSet<String> = HashSet::new();
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            updated_lines.push(line.clone());
+        } else {
+            // Check if this line corresponds to one of the exported patches
+            let mut found = false;
+            for (patchname, patchfile_name) in &patch_filenames {
+                // Check if the existing line matches this patch (by name pattern)
+                if trimmed.contains(patchname.as_str()) {
+                    updated_lines.push(patchfile_name.clone());
+                    processed_patches.insert(patchname.clone());
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                // Keep non-exported patches as-is, but check if we need to insert
+                // new patches before this one based on stack order
+
+                // Extract the patch name from the line (remove numbering prefix if present)
+                let line_patchname = if let Some(dash_pos) = trimmed.find('-') {
+                    // Check if prefix is all digits
+                    let prefix = &trimmed[..dash_pos];
+                    if prefix.chars().all(|c| c.is_ascii_digit()) {
+                        &trimmed[dash_pos + 1..]
+                    } else {
+                        trimmed
+                    }
+                } else {
+                    trimmed
+                };
+
+                // Remove extension if present
+                let line_patchname = if let Some(ext_pos) = line_patchname.rfind('.') {
+                    &line_patchname[..ext_pos]
+                } else {
+                    line_patchname
+                };
+
+                // Find position of this patch in the stack
+                let line_patch_pos = stack.all_patches()
+                    .position(|p| <PatchName as AsRef<str>>::as_ref(p) == line_patchname);
+
+                // Insert any new exported patches that should come before this patch
+                if let Some(line_pos) = line_patch_pos {
+                    for stack_patch in stack.all_patches() {
+                        let stack_patch_str = stack_patch.to_string();
+                        if exported_patches.contains(&stack_patch_str)
+                            && !processed_patches.contains(&stack_patch_str) {
+                            let stack_patch_pos = stack.all_patches()
+                                .position(|p| p == stack_patch)
+                                .unwrap();
+
+                            if stack_patch_pos < line_pos {
+                                if let Some(patchfile_name) = patch_filenames.get(&stack_patch_str) {
+                                    updated_lines.push(patchfile_name.clone());
+                                    processed_patches.insert(stack_patch_str);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                updated_lines.push(line.clone());
+            }
+        }
+    }
+
+    // Add any remaining new patches that weren't inserted yet
+    for stack_patch in stack.all_patches() {
+        let stack_patch_str = stack_patch.to_string();
+        if exported_patches.contains(&stack_patch_str)
+            && !processed_patches.contains(&stack_patch_str) {
+            if let Some(patchfile_name) = patch_filenames.get(&stack_patch_str) {
+                updated_lines.push(patchfile_name.clone());
+                processed_patches.insert(stack_patch_str);
+            }
+        }
+    }
+
+    // Write the updated series file
+    let mut content = updated_lines.join("\n");
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+
+    std::fs::write(series_path, content)
+        .with_context(|| format!("writing {series_path:?}"))?;
+
+    Ok(())
 }
 
 fn run(matches: &clap::ArgMatches) -> Result<()> {
@@ -178,8 +364,11 @@ fn run(matches: &clap::ArgMatches) -> Result<()> {
 
     let diff_opts = argset::get_diff_opts(matches, &repo.config_snapshot(), false, true);
 
+    let format_patch_flag = matches.get_flag("format-patch");
     let template = if let Some(template_file) = matches.get_one::<PathBuf>("template") {
         Cow::Owned(std::fs::read_to_string(template_file)?)
+    } else if format_patch_flag {
+        Cow::Borrowed(crate::templates::PATCHEXPORT_FORMAT_PATCH_TMPL)
     } else {
         match crate::templates::get_template(&repo, "patchexport.tmpl") {
             Ok(Some(template)) => Cow::Owned(template),
@@ -189,6 +378,7 @@ fn run(matches: &clap::ArgMatches) -> Result<()> {
     };
 
     let need_diffstat = template.contains("%(diffstat)");
+    let need_clean_subject = template.contains("%(shortdescr-clean)");
 
     let stdout_flag = matches.get_flag("stdout");
     let mut series = format!(
@@ -228,17 +418,25 @@ fn run(matches: &clap::ArgMatches) -> Result<()> {
         replacements.insert("description", Cow::Borrowed(description.into()));
         replacements.insert("shortdescr", Cow::Borrowed(shortdescr.into()));
         replacements.insert("longdescr", Cow::Borrowed(longdescr.into()));
+
+        if need_clean_subject {
+            let shortdescr_clean = strip_patch_prefix(shortdescr);
+            replacements.insert("shortdescr-clean", Cow::Owned(shortdescr_clean.into()));
+        }
         let author = patch_commit.author()?;
         replacements.insert("authname", Cow::Borrowed(author.name));
         replacements.insert("authemail", Cow::Borrowed(author.email));
+
+        // Use RFC2822 format for format-patch style, ISO8601 for default
+        let authdate_str = if format_patch_flag {
+            format_rfc2822(&author.time()?)
+        } else {
+            author.time()?.format(gix::date::time::format::ISO8601).to_string()
+        };
+
         replacements.insert(
             "authdate",
-            Cow::Owned(
-                author
-                    .time()?
-                    .format(gix::date::time::format::ISO8601)
-                    .into(),
-            ),
+            Cow::Owned(authdate_str.into()),
         );
         let committer = patch_commit.committer()?;
         replacements.insert("commname", Cow::Borrowed(committer.name));
@@ -301,10 +499,68 @@ fn run(matches: &clap::ArgMatches) -> Result<()> {
     }
 
     if !stdout_flag {
-        let series_path = output_dir.join("series");
-        std::fs::write(&series_path, series.as_str())
-            .with_context(|| format!("writing {series_path:?}"))?;
+        let no_series = matches.get_flag("no-series");
+        let update_series = matches.get_flag("update-series");
+
+        if !no_series {
+            let series_path = output_dir.join("series");
+
+            if update_series {
+                // Update mode: merge with existing series file
+                update_series_file(&series_path, &patches, &stack, numbered_flag, num_width, extension)?;
+            } else {
+                // Default mode: replace entire series file
+                std::fs::write(&series_path, series.as_str())
+                    .with_context(|| format!("writing {series_path:?}"))?;
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Strip [PATCH], [RFC PATCH], and similar prefixes from subject line.
+fn strip_patch_prefix(subject: &str) -> String {
+    let subject = subject.trim();
+
+    // Match patterns like [PATCH], [RFC PATCH], [PATCH v2], [PATCH 1/3], etc.
+    if let Some(stripped) = subject.strip_prefix('[') {
+        if let Some(pos) = stripped.find(']') {
+            let prefix = &stripped[..pos];
+            // Check if it looks like a patch prefix
+            if prefix.split_whitespace().any(|word| {
+                word.eq_ignore_ascii_case("PATCH")
+                    || word.eq_ignore_ascii_case("RFC")
+                    || word.starts_with("v")
+                    || word.contains('/')
+            }) {
+                return stripped[pos + 1..].trim_start().to_string();
+            }
+        }
+    }
+
+    subject.to_string()
+}
+
+/// Format a git time in RFC2822 format (e.g., "Mon, 16 Nov 2020 18:11:47 -0800")
+fn format_rfc2822(time: &gix::date::Time) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let timestamp = UNIX_EPOCH + Duration::from_secs(time.seconds as u64);
+    let offset_seconds = time.offset;
+
+    // Convert to jiff::Zoned for formatting
+    if let Ok(zoned) = jiff::Zoned::try_from(timestamp) {
+        // Adjust for the timezone offset
+        let offset_hours = offset_seconds / 3600;
+        let offset_mins = (offset_seconds.abs() % 3600) / 60;
+        let offset_str = format!("{:+03}{:02}", offset_hours, offset_mins);
+
+        // Format: "Mon, 16 Nov 2020 18:11:47 -0800"
+        let formatted = zoned.strftime("%a, %d %b %Y %H:%M:%S");
+        format!("{} {}", formatted, offset_str)
+    } else {
+        // Fallback to DEFAULT format if conversion fails
+        time.format(gix::date::time::format::DEFAULT).to_string()
+    }
 }

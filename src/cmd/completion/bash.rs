@@ -308,7 +308,7 @@ fn insert_compreply(script: &mut ShStream, arg: &clap::Arg) {
             }
             clap::ValueHint::DirPath => {
                 script.line(
-                    "mapfile -t COMPREPLY < <(compgen -o directory -A directory -- \"$cur\")",
+                    "mapfile -t COMPREPLY < <(compgen -A directory -- \"$cur\")",
                 );
             }
             clap::ValueHint::EmailAddress => {

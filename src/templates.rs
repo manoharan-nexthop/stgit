@@ -147,3 +147,14 @@ From: %(authname)s <%(authemail)s>
 ---
 %(diffstat)s
 ";
+
+/// Git format-patch style export template.
+pub(crate) const PATCHEXPORT_FORMAT_PATCH_TMPL: &str = "\
+From: %(authname)s <%(authemail)s>
+Date: %(authdate)s
+Subject: %(shortdescr-clean)s
+
+%(longdescr)s
+---
+%(diffstat)s
+";
