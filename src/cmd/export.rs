@@ -219,46 +219,44 @@ fn update_series_file(
         if trimmed.starts_with('#') || trimmed.is_empty() {
             updated_lines.push(line.clone());
         } else {
+            // Extract the patch name from the line (remove numbering prefix if present)
+            let line_patchname = if let Some(dash_pos) = trimmed.find('-') {
+                // Check if prefix is all digits
+                let prefix = &trimmed[..dash_pos];
+                if prefix.chars().all(|c| c.is_ascii_digit()) {
+                    &trimmed[dash_pos + 1..]
+                } else {
+                    trimmed
+                }
+            } else {
+                trimmed
+            };
+
+            // Remove extension if present
+            let line_patchname = if let Some(ext_pos) = line_patchname.rfind('.') {
+                &line_patchname[..ext_pos]
+            } else {
+                line_patchname
+            };
+
             // Check if this line corresponds to one of the exported patches
-            let mut found = false;
-            for (patchname, patchfile_name) in &patch_filenames {
-                // Check if the existing line matches this patch (by name pattern)
-                if trimmed.contains(patchname.as_str()) {
-                    updated_lines.push(patchfile_name.clone());
-                    processed_patches.insert(patchname.clone());
-                    found = true;
+            let mut is_exported_patch = false;
+            for patchname in patch_filenames.keys() {
+                if line_patchname == patchname.as_str() {
+                    is_exported_patch = true;
                     break;
                 }
             }
-            if !found {
-                // Keep non-exported patches as-is, but check if we need to insert
-                // new patches before this one based on stack order
 
-                // Extract the patch name from the line (remove numbering prefix if present)
-                let line_patchname = if let Some(dash_pos) = trimmed.find('-') {
-                    // Check if prefix is all digits
-                    let prefix = &trimmed[..dash_pos];
-                    if prefix.chars().all(|c| c.is_ascii_digit()) {
-                        &trimmed[dash_pos + 1..]
-                    } else {
-                        trimmed
-                    }
-                } else {
-                    trimmed
-                };
-
-                // Remove extension if present
-                let line_patchname = if let Some(ext_pos) = line_patchname.rfind('.') {
-                    &line_patchname[..ext_pos]
-                } else {
-                    line_patchname
-                };
+            if !is_exported_patch {
+                // This is a non-exported patch, keep it but check if we need to insert
+                // any exported patches before it based on stack order
 
                 // Find position of this patch in the stack
                 let line_patch_pos = stack.all_patches()
                     .position(|p| <PatchName as AsRef<str>>::as_ref(p) == line_patchname);
 
-                // Insert any new exported patches that should come before this patch
+                // Insert any unprocessed exported patches that should come before this patch
                 if let Some(line_pos) = line_patch_pos {
                     for stack_patch in stack.all_patches() {
                         let stack_patch_str = stack_patch.to_string();
@@ -278,8 +276,11 @@ fn update_series_file(
                     }
                 }
 
+                // Add the non-exported patch line
                 updated_lines.push(line.clone());
             }
+            // If it's an exported patch, skip it here - we'll add it in the correct position
+            // based on stack order when we encounter the right non-exported patch or at the end
         }
     }
 
