@@ -158,7 +158,17 @@ impl StupidContext<'_, '_> {
             Ok(None)
         } else {
             let err = git_command_error("apply --index", &apply_output.stderr);
-            if reject && apply_output.status.code() == Some(1) {
+            if (reject || threeway) && apply_output.status.code() == Some(1) {
+                // For threeway merges, check if there are actually unmerged files.
+                // If git apply --3way fails without creating unmerged entries,
+                // it's a hard failure (e.g., file doesn't exist), not a conflict.
+                if threeway && !reject {
+                    let unmerged = self.diff_unmerged_names()?;
+                    if unmerged.is_empty() {
+                        // No unmerged files means the patch didn't apply at all
+                        return Err(err);
+                    }
+                }
                 Ok(Some(format!("{err:#}")))
             } else {
                 Err(err)

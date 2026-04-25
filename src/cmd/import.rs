@@ -27,6 +27,49 @@ pub(super) const STGIT_COMMAND: super::StGitCommand = super::StGitCommand {
     run,
 };
 
+/// State for an interrupted series import
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ImportState {
+    /// Remaining patches to import from series
+    remaining_patches: Vec<PathBuf>,
+    /// Options to use for import (threeway, reject, strip, etc.)
+    threeway: bool,
+    reject: bool,
+    strip: Option<usize>,
+    context_lines: Option<usize>,
+    directory: Option<PathBuf>,
+}
+
+impl ImportState {
+    fn save(&self, repo: &gix::Repository) -> Result<()> {
+        let state_path = repo.git_dir().join("stgit-import-state");
+        let state_json = serde_json::to_string_pretty(self)?;
+        std::fs::write(&state_path, state_json)
+            .with_context(|| format!("saving import state to {}", state_path.display()))?;
+        Ok(())
+    }
+
+    fn load(repo: &gix::Repository) -> Result<Option<Self>> {
+        let state_path = repo.git_dir().join("stgit-import-state");
+        if !state_path.exists() {
+            return Ok(None);
+        }
+        let state_json = std::fs::read_to_string(&state_path)
+            .with_context(|| format!("reading import state from {}", state_path.display()))?;
+        let state: ImportState = serde_json::from_str(&state_json)?;
+        Ok(Some(state))
+    }
+
+    fn remove(repo: &gix::Repository) -> Result<()> {
+        let state_path = repo.git_dir().join("stgit-import-state");
+        if state_path.exists() {
+            std::fs::remove_file(&state_path)
+                .with_context(|| format!("removing import state file {}", state_path.display()))?;
+        }
+        Ok(())
+    }
+}
+
 fn make() -> clap::Command {
     let app = clap::Command::new("import")
         .about("Import patches to stack")
@@ -221,12 +264,46 @@ fn make() -> clap::Command {
                     the \"stgit.import.message-id\" configuration option.",
                 )
                 .action(clap::ArgAction::SetTrue),
+        )
+        .next_help_heading("Series Import Options")
+        .arg(
+            Arg::new("continue")
+                .long("continue")
+                .help("Continue importing series after resolving conflicts")
+                .long_help(
+                    "Continue importing remaining patches from a series after resolving \
+                     conflicts. This option is only valid when a previous 'stg import -S' \
+                     operation was interrupted due to conflicts.",
+                )
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with_all(["source", "mail", "mbox", "series", "url"]),
+        )
+        .arg(
+            Arg::new("abort")
+                .long("abort")
+                .help("Abort an interrupted series import")
+                .long_help(
+                    "Abort a series import operation that was interrupted due to conflicts. \
+                     The imported patches will remain on the stack, but the remaining patches \
+                     in the series will not be imported.",
+                )
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with_all(["source", "mail", "mbox", "series", "url", "continue"]),
         );
     patchedit::add_args(app, false, false)
 }
 
 fn run(matches: &clap::ArgMatches) -> Result<()> {
     let repo = gix::Repository::open()?;
+
+    // Handle --continue and --abort
+    if matches.get_flag("continue") {
+        return import_continue(&repo, matches);
+    }
+    if matches.get_flag("abort") {
+        return import_abort(&repo);
+    }
+
     let stack = Stack::current(&repo, InitializationPolicy::AutoInitialize)?;
     let stupid = repo.stupid();
 
@@ -254,6 +331,37 @@ fn run(matches: &clap::ArgMatches) -> Result<()> {
         import_file(stack, matches, source_path.as_deref(), None)?;
         Ok(())
     }
+}
+
+fn import_continue(repo: &gix::Repository, matches: &clap::ArgMatches) -> Result<()> {
+    let state = ImportState::load(repo)?
+        .ok_or_else(|| anyhow!("no interrupted import to continue"))?;
+
+    let stack = Stack::current(repo, InitializationPolicy::RequireInitialized)?;
+    let stupid = repo.stupid();
+
+    // Check that conflicts have been resolved
+    let statuses = stupid.statuses(None)?;
+    statuses.check_conflicts()?;
+
+    print_info_message(
+        matches,
+        &format!("Continuing import with {} remaining patches", state.remaining_patches.len()),
+    );
+
+    // Continue importing from where we left off
+    import_series_with_state(stack, matches, state, repo)
+}
+
+fn import_abort(repo: &gix::Repository) -> Result<()> {
+    let state = ImportState::load(repo)?;
+    if state.is_none() {
+        return Err(anyhow!("no interrupted import to abort"));
+    }
+
+    ImportState::remove(repo)?;
+    println!("Import aborted. The imported patches remain on the stack.");
+    Ok(())
 }
 
 #[cfg(not(feature = "import-url"))]
@@ -315,6 +423,133 @@ fn import_url(stack: Stack, matches: &clap::ArgMatches) -> Result<()> {
     }
 }
 
+/// Import a list of patches, saving state if interrupted by conflicts
+fn import_patches_with_state(
+    mut stack: Stack,
+    matches: &clap::ArgMatches,
+    patches: Vec<(PathBuf, Option<usize>)>,
+) -> Result<()> {
+    let repo = stack.repo;
+
+    for (i, (patch_path, strip_level)) in patches.iter().enumerate() {
+        match import_file(stack, matches, Some(patch_path.as_path()), *strip_level) {
+            Ok(new_stack) => {
+                stack = new_stack;
+            }
+            Err(e) => {
+                // Check if it's a conflict error
+                if let Some(super::Error::CausedConflicts(_)) = e.downcast_ref::<super::Error>() {
+                    // Save state for remaining patches
+                    let remaining: Vec<PathBuf> = patches[i + 1..]
+                        .iter()
+                        .map(|(p, _)| p.clone())
+                        .collect();
+
+                    if !remaining.is_empty() {
+                        let state = ImportState {
+                            remaining_patches: remaining.clone(),
+                            threeway: matches.get_flag("3way"),
+                            reject: matches.get_flag("reject"),
+                            strip: matches.get_one::<usize>("strip").copied(),
+                            context_lines: matches.get_one::<usize>("context-lines").copied(),
+                            directory: matches.get_one::<PathBuf>("directory").cloned(),
+                        };
+                        state.save(repo)?;
+
+                        eprintln!(
+                            "\nConflicts occurred during import. {} patches remaining.",
+                            remaining.len()
+                        );
+                        eprintln!("After resolving conflicts, run:");
+                        eprintln!("  stg refresh             # to update the current patch");
+                        eprintln!("  stg import --continue   # to continue importing remaining patches");
+                        eprintln!("Or run:");
+                        eprintln!("  stg import --abort      # to stop the import");
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    // All patches imported successfully, remove state file if it exists
+    ImportState::remove(repo)?;
+    Ok(())
+}
+
+/// Continue importing with saved state
+fn import_series_with_state(
+    mut stack: Stack,
+    matches: &clap::ArgMatches,
+    state: ImportState,
+    repo: &gix::Repository,
+) -> Result<()> {
+    let patches: Vec<(PathBuf, Option<usize>)> = state
+        .remaining_patches
+        .iter()
+        .map(|p| (p.clone(), state.strip))
+        .collect();
+
+    // Import remaining patches, using saved options from state
+    for (i, (patch_path, strip_level)) in patches.iter().enumerate() {
+        match import_file_with_options(
+            stack,
+            matches,
+            Some(patch_path.as_path()),
+            *strip_level,
+            state.threeway,
+            state.reject,
+            state.context_lines,
+            state.directory.as_deref(),
+        ) {
+            Ok(new_stack) => {
+                stack = new_stack;
+            }
+            Err(e) => {
+                // Check if it's a conflict error
+                if let Some(super::Error::CausedConflicts(_)) = e.downcast_ref::<super::Error>() {
+                    // Update state with remaining patches
+                    let remaining: Vec<PathBuf> = patches[i + 1..]
+                        .iter()
+                        .map(|(p, _)| p.clone())
+                        .collect();
+
+                    if !remaining.is_empty() {
+                        let new_state = ImportState {
+                            remaining_patches: remaining.clone(),
+                            threeway: state.threeway,
+                            reject: state.reject,
+                            strip: state.strip,
+                            context_lines: state.context_lines,
+                            directory: state.directory.clone(),
+                        };
+                        new_state.save(repo)?;
+
+                        eprintln!(
+                            "\nConflicts occurred during import. {} patches remaining.",
+                            remaining.len()
+                        );
+                        eprintln!("After resolving conflicts, run:");
+                        eprintln!("  stg refresh             # to update the current patch");
+                        eprintln!("  stg import --continue   # to continue importing remaining patches");
+                        eprintln!("Or run:");
+                        eprintln!("  stg import --abort      # to stop the import");
+                    } else {
+                        // Last patch had conflicts, remove state
+                        ImportState::remove(repo)?;
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    // All remaining patches imported successfully
+    ImportState::remove(repo)?;
+    println!("Series import completed successfully.");
+    Ok(())
+}
+
 fn import_tgz_series(stack: Stack, matches: &clap::ArgMatches, source_path: &Path) -> Result<()> {
     let source_file = std::fs::File::open(source_path)?;
     let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(source_file));
@@ -367,7 +602,8 @@ fn import_series(
         buf
     };
 
-    let mut stack = stack;
+    // Parse all patches from series file
+    let mut patches_to_import = Vec::new();
 
     for line in series.lines() {
         let line = line
@@ -407,9 +643,11 @@ fn import_series(
             None
         };
 
-        stack = import_file(stack, matches, Some(patch_path.as_path()), strip_level)?;
+        patches_to_import.push((patch_path, strip_level));
     }
-    Ok(())
+
+    // Import patches with state tracking
+    import_patches_with_state(stack, matches, patches_to_import)
 }
 
 fn find_series_path(base: &Path) -> Result<PathBuf> {
@@ -467,6 +705,71 @@ fn read_bz2(source_file: std::fs::File, content: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// Import a file with explicit options (used by --continue)
+fn import_file_with_options<'repo>(
+    stack: Stack<'repo>,
+    matches: &clap::ArgMatches,
+    source_path: Option<&Path>,
+    strip_level: Option<usize>,
+    threeway: bool,
+    reject: bool,
+    context_lines: Option<usize>,
+    directory: Option<&Path>,
+) -> Result<Stack<'repo>> {
+    let content: Vec<u8>;
+    if let Some(source_path) = source_path {
+        let mut content_buf = Vec::new();
+        let source_file = std::fs::File::open(source_path)?;
+        match source_path.extension().and_then(std::ffi::OsStr::to_str) {
+            Some("gz") => read_gz(source_file, &mut content_buf)?,
+            Some("bz2") => read_bz2(source_file, &mut content_buf)?,
+            _ => {
+                let mut source_file = source_file;
+                source_file.read_to_end(&mut content_buf)?;
+            }
+        }
+        content = content_buf;
+    } else {
+        let stdin = std::io::stdin();
+        let mut content_buf = Vec::new();
+        stdin.lock().read_to_end(&mut content_buf)?;
+        content = content_buf;
+    };
+
+    let (message, diff) = split_patch(content)?;
+    let (headers, mut message) = Headers::parse_message(message.as_ref())?;
+
+    if let Some(message_id) = headers
+        .message_id
+        .as_ref()
+        .filter(|_| use_message_id(matches, &stack.repo.config_snapshot()))
+    {
+        if message.last() != Some(&b'\n') {
+            message.push(b'\n');
+        }
+        if message.len() > 1 && &message[message.len() - 2..] != b"\n\n" {
+            message.push(b'\n');
+        }
+        message.push_str("Message-ID: ");
+        message.push_str(message_id);
+        message.push(b'\n');
+    }
+
+    create_patch_with_options(
+        stack,
+        matches,
+        source_path,
+        headers,
+        message.as_bstr(),
+        diff.as_bstr(),
+        strip_level,
+        threeway,
+        reject,
+        context_lines,
+        directory,
+    )
+}
+
 fn import_file<'repo>(
     stack: Stack<'repo>,
     matches: &clap::ArgMatches,
@@ -508,7 +811,7 @@ fn import_file<'repo>(
         message.push(b'\n');
     }
 
-    create_patch(
+    create_patch_with_options(
         stack,
         matches,
         source_path,
@@ -516,6 +819,10 @@ fn import_file<'repo>(
         message.as_bstr(),
         diff.as_bstr(),
         strip_level,
+        matches.get_flag("3way"),
+        matches.get_flag("reject"),
+        matches.get_one::<usize>("context-lines").copied(),
+        matches.get_one::<PathBuf>("directory").map(|p| p.as_path()),
     )
 }
 
@@ -527,6 +834,34 @@ fn create_patch<'repo>(
     message: &BStr,
     diff: &BStr,
     strip_level: Option<usize>,
+) -> Result<Stack<'repo>> {
+    create_patch_with_options(
+        stack,
+        matches,
+        source_path,
+        headers,
+        message,
+        diff,
+        strip_level,
+        matches.get_flag("3way"),
+        matches.get_flag("reject"),
+        matches.get_one::<usize>("context-lines").copied(),
+        matches.get_one::<PathBuf>("directory").map(|p| p.as_path()),
+    )
+}
+
+fn create_patch_with_options<'repo>(
+    stack: Stack<'repo>,
+    matches: &clap::ArgMatches,
+    source_path: Option<&Path>,
+    headers: Headers,
+    message: &BStr,
+    diff: &BStr,
+    strip_level: Option<usize>,
+    threeway: bool,
+    reject: bool,
+    context_lines: Option<usize>,
+    directory: Option<&Path>,
 ) -> Result<Stack<'repo>> {
     let config = stack.repo.config_snapshot();
 
@@ -616,13 +951,11 @@ fn create_patch<'repo>(
     } else {
         match stupid.apply_to_worktree_and_index(
             diff,
-            matches.get_flag("reject"),
-            matches.get_flag("3way"),
+            reject,
+            threeway,
             strip_level,
-            matches
-                .get_one::<PathBuf>("directory")
-                .map(|path_buf| path_buf.as_path()),
-            matches.get_one::<usize>("context-lines").copied(),
+            directory,
+            context_lines,
         ) {
             Ok(None) => true,
             Ok(Some(output)) => {
@@ -634,7 +967,12 @@ fn create_patch<'repo>(
     };
 
     // If the patch was empty this will not create a new tree object.
-    let tree_id = stupid.write_tree()?;
+    // If there are conflicts, use the parent tree (similar to stg push with conflicts).
+    let tree_id = if applied_cleanly {
+        stupid.write_tree()?
+    } else {
+        stack.get_branch_head().tree_id()?.detach()
+    };
 
     let (new_patchname, commit_id) = match crate::patch::edit::EditBuilder::default()
         .original_patchname(Some(&patchname))
