@@ -13,11 +13,11 @@ use clap::{Arg, ArgGroup};
 
 use crate::{
     color::get_color_stdout,
-    ext::{RepositoryExtended, TimeExtended},
+    ext::{CommitExtended, RepositoryExtended, TimeExtended},
     patch::{patchedit, PatchName},
     print_info_message,
     stack::{InitializationPolicy, Stack, StackAccess, StackStateAccess},
-    stupid::Stupid,
+    stupid::{Status, Stupid},
 };
 
 pub(super) const STGIT_COMMAND: super::StGitCommand = super::StGitCommand {
@@ -343,6 +343,42 @@ fn import_continue(repo: &gix::Repository, matches: &clap::ArgMatches) -> Result
     // Check that conflicts have been resolved
     let statuses = stupid.statuses(None)?;
     statuses.check_conflicts()?;
+
+    // If the user staged conflict resolutions without running `stg refresh` first,
+    // auto-refresh the top patch like `git rebase --continue` does.
+    let has_staged_changes = statuses
+        .iter()
+        .any(|entry| !matches!(entry.index_status(), Status::Unmodified));
+
+    let stack = if has_staged_changes {
+        let patchname = stack
+            .applied()
+            .last()
+            .ok_or(super::Error::NoAppliedPatches)?
+            .clone();
+        eprintln!("Auto-refreshing patch '{patchname}' with staged changes...");
+        let patch_commit = stack.get_patch_commit(&patchname);
+        let patch_commit_ref = patch_commit.decode()?;
+        let author = patch_commit.author_strict()?;
+        let committer = repo.get_committer()?.to_owned()?;
+        let tree_id = stupid.write_tree()?;
+        let commit_id = repo.commit_ex(
+            &author,
+            &committer,
+            &patch_commit.message_ex(),
+            tree_id,
+            patch_commit_ref.parents(),
+        )?;
+        drop(patch_commit_ref);
+        stack
+            .setup_transaction()
+            .use_index_and_worktree(false)
+            .with_output_stream(get_color_stdout(matches))
+            .transact(|trans| trans.update_patch(&patchname, commit_id))
+            .execute(&format!("refresh {patchname}"))?
+    } else {
+        stack
+    };
 
     print_info_message(
         matches,
