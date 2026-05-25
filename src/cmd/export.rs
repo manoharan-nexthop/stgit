@@ -18,7 +18,7 @@ use crate::{
     argset,
     branchloc::BranchLocator,
     ext::{CommitExtended, RepositoryExtended},
-    patch::{patchrange, PatchName, PatchRange, RangeConstraint},
+    patch::{patchrange, PatchRange, RangeConstraint},
     stack::{InitializationPolicy, Stack, StackAccess, StackStateAccess},
     stupid::Stupid,
 };
@@ -160,27 +160,22 @@ fn make() -> clap::Command {
         .arg(argset::diff_opts_arg())
 }
 
-/// Strip a leading `NNNN-` numeric prefix and any trailing file extension so that
+/// Normalise a patch filename or stg patch name to its base identifier so that
 /// series file entries can be matched against stg patch names regardless of whether
 /// the stack was imported with or without `--stripname`.
 ///
-/// Examples: `"0237-foo.patch"` → `"foo"`, `"01-bar"` → `"bar"`, `"baz.diff"` → `"baz"`.
+/// Mirrors `stripname()` in `import.rs`: greedily strips all leading digit+dash
+/// characters, then removes a trailing `.patch` or `.diff` extension only.
+///
+/// Examples: `"0237-foo.patch"` → `"foo"`, `"01-02-bar"` → `"bar"`, `"baz.diff"` → `"baz"`.
 fn normalize_patch_ident(s: &str) -> &str {
-    let s = if let Some(dash_pos) = s.find('-') {
-        let prefix = &s[..dash_pos];
-        if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
-            &s[dash_pos + 1..]
-        } else {
-            s
-        }
-    } else {
-        s
-    };
-    if let Some(dot_pos) = s.rfind('.') {
-        &s[..dot_pos]
-    } else {
-        s
-    }
+    let stripped = s.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
+    // Only apply the prefix strip when there is a non-empty text component left.
+    // Pure-numeric names like "001" must remain as-is (stripping would give "").
+    let s = if stripped.is_empty() { s } else { stripped };
+    s.strip_suffix(".patch")
+        .or_else(|| s.strip_suffix(".diff"))
+        .unwrap_or(s)
 }
 
 /// Update an existing series file by adding or updating entries for exported patches.
@@ -194,7 +189,6 @@ fn update_series_file(
 ) -> Result<()> {
     use std::collections::HashSet;
 
-    // Read existing series file if it exists
     let existing_content = if series_path.exists() {
         std::fs::read_to_string(series_path)
             .with_context(|| format!("reading {series_path:?}"))?
@@ -202,34 +196,46 @@ fn update_series_file(
         String::new()
     };
 
-    // Parse existing series file to preserve comments and non-exported patches
-    let mut lines: Vec<String> = Vec::new();
+    // Preserve every line — including blank separators — as-is.
+    let lines: Vec<String> = existing_content.lines().map(str::to_string).collect();
 
-    for line in existing_content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            lines.push(line.to_string());
-        } else if !trimmed.is_empty() {
-            lines.push(line.to_string());
-        }
-    }
-
-    // Build a map of patch names to their filenames
+    // Build patch-name → output-filename map.
     let mut patch_filenames: HashMap<String, String> = HashMap::new();
     for (i, patchname) in patches.iter().enumerate() {
         let patchfile_name = if numbered_flag {
-            let patch_number = i + 1;
-            format!("{patch_number:0num_width$}-{patchname}{extension}")
+            format!("{:0num_width$}-{patchname}{extension}", i + 1)
         } else {
             format!("{patchname}{extension}")
         };
         patch_filenames.insert(patchname.to_string(), patchfile_name);
     }
 
-    // Build a set of patches being exported for quick lookup
-    let exported_patches: HashSet<String> = patches.iter().map(|p| p.to_string()).collect();
+    // Precompute once to avoid O(n³) repeated iteration over the stack.
+    //
+    // normalized-name → stack position
+    let stack_positions: HashMap<String, usize> = stack
+        .all_patches()
+        .enumerate()
+        .map(|(i, p)| (normalize_patch_ident(p.as_ref()).to_string(), i))
+        .collect();
 
-    // Update or add entries for exported patches
+    // normalized-name → original patch-name (for series-line → exported-patch matching)
+    let normalized_exported: HashMap<String, String> = patch_filenames
+        .keys()
+        .map(|name| (normalize_patch_ident(name.as_str()).to_string(), name.clone()))
+        .collect();
+
+    // Exported patches sorted by stack position for ordered insertion.
+    let mut exported_by_pos: Vec<(usize, String)> = patch_filenames
+        .keys()
+        .filter_map(|name| {
+            stack_positions
+                .get(normalize_patch_ident(name.as_str()))
+                .map(|&pos| (pos, name.clone()))
+        })
+        .collect();
+    exported_by_pos.sort_unstable_by_key(|(pos, _)| *pos);
+
     let mut updated_lines: Vec<String> = Vec::new();
     let mut processed_patches: HashSet<String> = HashSet::new();
 
@@ -237,99 +243,50 @@ fn update_series_file(
         let trimmed = line.trim();
         if trimmed.starts_with('#') || trimmed.is_empty() {
             updated_lines.push(line.clone());
+            continue;
+        }
+
+        // Normalize the series-line identifier using the same algorithm as
+        // stripname() in import.rs: greedy digit/dash strip + .patch/.diff only.
+        let line_norm = normalize_patch_ident(trimmed);
+
+        if let Some(patchname) = normalized_exported.get(line_norm).cloned() {
+            // This series entry corresponds to one of the exported patches.
+            // Replace in-place (handles numbering/extension changes) and mark
+            // processed so the trailing loop doesn't append a duplicate.
+            updated_lines.push(patch_filenames[&patchname].clone());
+            processed_patches.insert(patchname);
         } else {
-            // Extract the patch name from the line (remove numbering prefix if present)
-            let line_patchname = if let Some(dash_pos) = trimmed.find('-') {
-                // Check if prefix is all digits
-                let prefix = &trimmed[..dash_pos];
-                if prefix.chars().all(|c| c.is_ascii_digit()) {
-                    &trimmed[dash_pos + 1..]
-                } else {
-                    trimmed
-                }
-            } else {
-                trimmed
-            };
-
-            // Remove extension if present
-            let line_patchname = if let Some(ext_pos) = line_patchname.rfind('.') {
-                &line_patchname[..ext_pos]
-            } else {
-                line_patchname
-            };
-
-            // Check if this line corresponds to one of the exported patches.
-            // Compare the normalised series-line name against both the raw patch name
-            // and its normalised form, because stg patch names retain their `NNNN-`
-            // prefix and `.patch` extension when the stack was imported without
-            // `--stripname` (e.g. `0237-foo.patch`).
-            let matching_exported = patch_filenames
-                .keys()
-                .find(|patchname| {
-                    let p = patchname.as_str();
-                    line_patchname == p || line_patchname == normalize_patch_ident(p)
-                })
-                .cloned();
-
-            if let Some(patchname) = matching_exported {
-                // Replace in-place with the new filename (handles format/numbering changes)
-                // and mark processed so the trailing loop doesn't append a duplicate.
-                let patchfile_name = patch_filenames.get(&patchname).unwrap().clone();
-                updated_lines.push(patchfile_name);
-                processed_patches.insert(patchname);
-            } else {
-                // Non-exported patch: keep it, but first insert any unprocessed exported
-                // patches that belong before it according to stack order.
-                // Use normalised comparison so patches imported without --stripname
-                // (which retain numeric prefix/extension in their stg name) are found.
-                let line_patch_pos = stack.all_patches().position(|p| {
-                    let s = <PatchName as AsRef<str>>::as_ref(p);
-                    s == line_patchname || normalize_patch_ident(s) == line_patchname
-                });
-
-                if let Some(line_pos) = line_patch_pos {
-                    for stack_patch in stack.all_patches() {
-                        let stack_patch_str = stack_patch.to_string();
-                        if exported_patches.contains(&stack_patch_str)
-                            && !processed_patches.contains(&stack_patch_str)
-                        {
-                            let stack_patch_pos = stack.all_patches()
-                                .position(|p| p == stack_patch)
-                                .unwrap();
-
-                            if stack_patch_pos < line_pos {
-                                if let Some(patchfile_name) = patch_filenames.get(&stack_patch_str) {
-                                    updated_lines.push(patchfile_name.clone());
-                                    processed_patches.insert(stack_patch_str);
-                                }
-                            }
-                        }
+            // Non-exported line: keep it, but first insert any unprocessed
+            // exported patches that belong before it in stack order.
+            if let Some(&line_pos) = stack_positions.get(line_norm) {
+                for (patch_pos, patchname) in &exported_by_pos {
+                    if *patch_pos >= line_pos {
+                        break; // vec is sorted — nothing further can be earlier
+                    }
+                    if !processed_patches.contains(patchname) {
+                        updated_lines.push(patch_filenames[patchname].clone());
+                        processed_patches.insert(patchname.clone());
                     }
                 }
-
-                updated_lines.push(line.clone());
             }
+            updated_lines.push(line.clone());
         }
     }
 
-    // Add any remaining new patches that weren't inserted yet
-    for stack_patch in stack.all_patches() {
-        let stack_patch_str = stack_patch.to_string();
-        if exported_patches.contains(&stack_patch_str)
-            && !processed_patches.contains(&stack_patch_str) {
-            if let Some(patchfile_name) = patch_filenames.get(&stack_patch_str) {
-                updated_lines.push(patchfile_name.clone());
-                processed_patches.insert(stack_patch_str);
-            }
+    // Append any exported patches not yet placed (new patches with no existing
+    // series entry, or patches whose surrounding context wasn't in the stack).
+    for (_, patchname) in &exported_by_pos {
+        if !processed_patches.contains(patchname) {
+            updated_lines.push(patch_filenames[patchname].clone());
+            processed_patches.insert(patchname.clone());
         }
     }
 
-    // Write the updated series file
     let mut content = updated_lines.join("\n");
     if !content.ends_with('\n') {
         content.push('\n');
     }
-
     std::fs::write(series_path, content)
         .with_context(|| format!("writing {series_path:?}"))?;
 
@@ -552,16 +509,13 @@ fn run(matches: &clap::ArgMatches) -> Result<()> {
 fn strip_patch_prefix(subject: &str) -> String {
     let subject = subject.trim();
 
-    // Match patterns like [PATCH], [RFC PATCH], [PATCH v2], [PATCH 1/3], etc.
+    // Only strip tags that contain "PATCH" or "RFC", e.g. [PATCH], [RFC PATCH], [PATCH v2 1/3].
+    // Do NOT strip kernel version/subsystem tags like [v5.15] or [net/ipv4].
     if let Some(stripped) = subject.strip_prefix('[') {
         if let Some(pos) = stripped.find(']') {
             let prefix = &stripped[..pos];
-            // Check if it looks like a patch prefix
             if prefix.split_whitespace().any(|word| {
-                word.eq_ignore_ascii_case("PATCH")
-                    || word.eq_ignore_ascii_case("RFC")
-                    || word.starts_with("v")
-                    || word.contains('/')
+                word.eq_ignore_ascii_case("PATCH") || word.eq_ignore_ascii_case("RFC")
             }) {
                 return stripped[pos + 1..].trim_start().to_string();
             }
@@ -571,25 +525,10 @@ fn strip_patch_prefix(subject: &str) -> String {
     subject.to_string()
 }
 
-/// Format a git time in RFC2822 format (e.g., "Mon, 16 Nov 2020 18:11:47 -0800")
+/// Format a git time in RFC2822 format (e.g., "Mon, 16 Nov 2020 18:11:47 -0800").
+///
+/// Uses gix-date's GIT_RFC2822 formatter which reads `time.offset` directly,
+/// avoiding both the local-timezone bug and the i64→u64 wrapping issue.
 fn format_rfc2822(time: &gix::date::Time) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-
-    let timestamp = UNIX_EPOCH + Duration::from_secs(time.seconds as u64);
-    let offset_seconds = time.offset;
-
-    // Convert to jiff::Zoned for formatting
-    if let Ok(zoned) = jiff::Zoned::try_from(timestamp) {
-        // Adjust for the timezone offset
-        let offset_hours = offset_seconds / 3600;
-        let offset_mins = (offset_seconds.abs() % 3600) / 60;
-        let offset_str = format!("{:+03}{:02}", offset_hours, offset_mins);
-
-        // Format: "Mon, 16 Nov 2020 18:11:47 -0800"
-        let formatted = zoned.strftime("%a, %d %b %Y %H:%M:%S");
-        format!("{} {}", formatted, offset_str)
-    } else {
-        // Fallback to DEFAULT format if conversion fails
-        time.format(gix::date::time::format::DEFAULT).to_string()
-    }
+    time.format(gix::date::time::format::GIT_RFC2822).to_string()
 }

@@ -256,4 +256,69 @@ test_expect_success 'Re-export patch with prefix+.patch in stg name does not dup
     test_cmp series-expected export10/series
 '
 
+test_expect_success 'Multi-segment numeric prefix round-trip with --update-series' '
+    # normalize_patch_ident must strip ALL leading digit+dash chars (like stripname()
+    # in import.rs), not just the first segment.  A series entry "01-02-foo.patch"
+    # should match the stg patch "foo" (imported with --stripname) and be updated
+    # in-place rather than duplicated.
+    git checkout -b test-multiseg &&
+    stg init &&
+
+    stg new -m "placeholder" &&
+    echo "x" >>foo.txt &&
+    stg refresh &&
+    stg rename "foo" &&
+
+    mkdir -p export11 &&
+    printf "00-preamble.patch\n" >export11/series &&
+    printf "01-02-foo.patch\n" >>export11/series &&
+    printf "99-epilogue.patch\n" >>export11/series &&
+
+    # Patch name is "foo"; existing series entry is "01-02-foo.patch".
+    # After -U the entry should be replaced with "foo" (no -n, no extension)
+    # at its original position — not duplicated at the end.
+    stg export -U -d export11 foo &&
+
+    cat >series-expected <<-\EOF &&
+	00-preamble.patch
+	foo
+	99-epilogue.patch
+	EOF
+
+    test_cmp series-expected export11/series
+'
+
+test_expect_success 'format-patch does not strip subsystem or version tags from subject' '
+    git checkout -b test-fp-prefix &&
+    stg init &&
+
+    stg new -m "[v5.15] net: fix something" &&
+    echo "a" >>foo.txt &&
+    stg refresh &&
+    stg new -m "[net/ipv4] tcp: fix routing" &&
+    echo "b" >>foo.txt &&
+    stg refresh &&
+
+    stg export -F -d export12 &&
+
+    # [v5.15] and [net/ipv4] must be preserved verbatim — they are NOT [PATCH] markers.
+    grep "^Subject: \[v5.15\] net: fix something" export12/v5.15-net-fix-something &&
+    grep "^Subject: \[net/ipv4\] tcp: fix routing" export12/net-ipv4-tcp-fix-routing
+'
+
+test_expect_success 'format-patch Date header uses author timezone not machine timezone' '
+    git checkout -b test-fp-date &&
+    stg init &&
+
+    stg new -m "timezone test" &&
+    echo "tz" >>foo.txt &&
+    stg refresh &&
+
+    stg export -F -d export13 &&
+
+    # Date: line must match RFC2822 format and include a timezone offset.
+    grep -E "^Date: [A-Za-z]{3}, +[0-9]+ [A-Za-z]{3} [0-9]{4} [0-9]{2}:[0-9]{2}:[0-9]{2} [+-][0-9]{4}$" \
+        export13/timezone-test
+'
+
 test_done
