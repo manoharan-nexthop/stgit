@@ -139,4 +139,121 @@ test_expect_success 'Test update-series with reordered patches' '
     test_cmp series-expected series-actual
 '
 
+test_expect_success 'Re-export existing patch with numbered series does not duplicate entry' '
+    # Simulate the case where the series file was originally created with numbered
+    # filenames (e.g. by a different tool) and the stg stack only covers a subset
+    # of the patches in that series file.
+    git checkout -b test-reexport &&
+    stg init &&
+
+    stg new -m "patch-a" &&
+    echo "a" >>foo.txt &&
+    stg refresh &&
+    stg new -m "patch-b" &&
+    echo "b" >>foo.txt &&
+    stg refresh &&
+
+    # Manually create a series file with numbered entries plus an extra entry
+    # that is NOT in the current stg stack (simulating a foreign series file).
+    mkdir -p export8 &&
+    printf "# This series applies on Git commit abc123\n" >export8/series &&
+    printf "0001-patch-a\n" >>export8/series &&
+    printf "0002-patch-b\n" >>export8/series &&
+    printf "0003-patch-c-not-in-stack\n" >>export8/series &&
+
+    # Re-export patch-b with -U; it is already in the series at position 2.
+    # The bug caused it to be appended at the end (after 0003-patch-c-not-in-stack).
+    stg export -U -n -d export8 patch-b &&
+
+    # With -n and only 1 patch being exported, num_width=2 so the filename
+    # becomes "01-patch-b" — but crucially it must stay at position 2, not
+    # be appended after the non-stack entry.
+    cat >series-expected <<-\EOF &&
+	# This series applies on Git commit abc123
+	0001-patch-a
+	01-patch-b
+	0003-patch-c-not-in-stack
+	EOF
+
+    test_cmp series-expected export8/series
+'
+
+test_expect_success 'Export new patch inserts at correct position based on stack order' '
+    git checkout -b test-insert &&
+    stg init &&
+
+    stg new -m "001" &&
+    echo "line 2" >>foo.txt &&
+    stg refresh &&
+    stg new -m "002" &&
+    echo "line 3" >>foo.txt &&
+    stg refresh &&
+    stg new -m "003" &&
+    echo "line 4" >>foo.txt &&
+    stg refresh &&
+    stg new -m "004" &&
+    echo "line 4b" >>foo.txt &&
+    stg refresh &&
+    stg new -m "005" &&
+    echo "line 5" >>foo.txt &&
+    stg refresh &&
+    stg new -m "006" &&
+    echo "line 6" >>foo.txt &&
+    stg refresh &&
+
+    # Export everything except 004 to create the initial series
+    stg export -d export9 001 002 003 005 006 &&
+    grep -v "^#" export9/series >initial-actual &&
+    printf "001\n002\n003\n005\n006\n" >initial-expected &&
+    test_cmp initial-expected initial-actual &&
+
+    # Now export just 004 with -U; it should be inserted between 003 and 005
+    # (the stack positions 003=2, 004=3, 005=4 drive the ordering).
+    stg export -U -d export9 004 &&
+
+    cat >series-expected <<-\EOF &&
+	001
+	002
+	003
+	004
+	005
+	006
+	EOF
+
+    grep -v "^#" export9/series >series-actual &&
+    test_cmp series-expected series-actual
+'
+
+test_expect_success 'Re-export patch with prefix+.patch in stg name does not duplicate' '
+    # When stg import -S is used WITHOUT --stripname the stg patch name keeps
+    # the numeric prefix AND the .patch extension, e.g. "0237-foo.patch".
+    # Re-exporting such a patch with -U must replace the series entry in-place,
+    # not leave the original line AND append a second entry at the end.
+    git checkout -b test-nostrip &&
+    stg init &&
+
+    stg new -m "placeholder" &&
+    echo "content" >>foo.txt &&
+    stg refresh &&
+    stg rename "0237-my-patch.patch" &&
+
+    mkdir -p export10 &&
+    printf "0236-prev-patch.patch\n" >export10/series &&
+    printf "0237-my-patch.patch\n" >>export10/series &&
+    printf "0238-next-patch.patch\n" >>export10/series &&
+
+    # Re-export the patch (patch name is "0237-my-patch.patch" in stg).
+    # The exported filename with no flags is also "0237-my-patch.patch".
+    # With the bug, the series gains a duplicate entry at the end.
+    stg export -U -d export10 "0237-my-patch.patch" &&
+
+    cat >series-expected <<-\EOF &&
+	0236-prev-patch.patch
+	0237-my-patch.patch
+	0238-next-patch.patch
+	EOF
+
+    test_cmp series-expected export10/series
+'
+
 test_done

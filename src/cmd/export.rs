@@ -160,6 +160,29 @@ fn make() -> clap::Command {
         .arg(argset::diff_opts_arg())
 }
 
+/// Strip a leading `NNNN-` numeric prefix and any trailing file extension so that
+/// series file entries can be matched against stg patch names regardless of whether
+/// the stack was imported with or without `--stripname`.
+///
+/// Examples: `"0237-foo.patch"` → `"foo"`, `"01-bar"` → `"bar"`, `"baz.diff"` → `"baz"`.
+fn normalize_patch_ident(s: &str) -> &str {
+    let s = if let Some(dash_pos) = s.find('-') {
+        let prefix = &s[..dash_pos];
+        if !prefix.is_empty() && prefix.chars().all(|c| c.is_ascii_digit()) {
+            &s[dash_pos + 1..]
+        } else {
+            s
+        }
+    } else {
+        s
+    };
+    if let Some(dot_pos) = s.rfind('.') {
+        &s[..dot_pos]
+    } else {
+        s
+    }
+}
+
 /// Update an existing series file by adding or updating entries for exported patches.
 fn update_series_file(
     series_path: &Path,
@@ -181,16 +204,12 @@ fn update_series_file(
 
     // Parse existing series file to preserve comments and non-exported patches
     let mut lines: Vec<String> = Vec::new();
-    let mut existing_patches: HashSet<String> = HashSet::new();
 
     for line in existing_content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('#') {
-            // Preserve all comments as-is (including base commit comment)
             lines.push(line.to_string());
         } else if !trimmed.is_empty() {
-            // Track existing patch entries
-            existing_patches.insert(trimmed.to_string());
             lines.push(line.to_string());
         }
     }
@@ -239,29 +258,41 @@ fn update_series_file(
                 line_patchname
             };
 
-            // Check if this line corresponds to one of the exported patches
-            let mut is_exported_patch = false;
-            for patchname in patch_filenames.keys() {
-                if line_patchname == patchname.as_str() {
-                    is_exported_patch = true;
-                    break;
-                }
-            }
+            // Check if this line corresponds to one of the exported patches.
+            // Compare the normalised series-line name against both the raw patch name
+            // and its normalised form, because stg patch names retain their `NNNN-`
+            // prefix and `.patch` extension when the stack was imported without
+            // `--stripname` (e.g. `0237-foo.patch`).
+            let matching_exported = patch_filenames
+                .keys()
+                .find(|patchname| {
+                    let p = patchname.as_str();
+                    line_patchname == p || line_patchname == normalize_patch_ident(p)
+                })
+                .cloned();
 
-            if !is_exported_patch {
-                // This is a non-exported patch, keep it but check if we need to insert
-                // any exported patches before it based on stack order
+            if let Some(patchname) = matching_exported {
+                // Replace in-place with the new filename (handles format/numbering changes)
+                // and mark processed so the trailing loop doesn't append a duplicate.
+                let patchfile_name = patch_filenames.get(&patchname).unwrap().clone();
+                updated_lines.push(patchfile_name);
+                processed_patches.insert(patchname);
+            } else {
+                // Non-exported patch: keep it, but first insert any unprocessed exported
+                // patches that belong before it according to stack order.
+                // Use normalised comparison so patches imported without --stripname
+                // (which retain numeric prefix/extension in their stg name) are found.
+                let line_patch_pos = stack.all_patches().position(|p| {
+                    let s = <PatchName as AsRef<str>>::as_ref(p);
+                    s == line_patchname || normalize_patch_ident(s) == line_patchname
+                });
 
-                // Find position of this patch in the stack
-                let line_patch_pos = stack.all_patches()
-                    .position(|p| <PatchName as AsRef<str>>::as_ref(p) == line_patchname);
-
-                // Insert any unprocessed exported patches that should come before this patch
                 if let Some(line_pos) = line_patch_pos {
                     for stack_patch in stack.all_patches() {
                         let stack_patch_str = stack_patch.to_string();
                         if exported_patches.contains(&stack_patch_str)
-                            && !processed_patches.contains(&stack_patch_str) {
+                            && !processed_patches.contains(&stack_patch_str)
+                        {
                             let stack_patch_pos = stack.all_patches()
                                 .position(|p| p == stack_patch)
                                 .unwrap();
@@ -276,11 +307,8 @@ fn update_series_file(
                     }
                 }
 
-                // Add the non-exported patch line
                 updated_lines.push(line.clone());
             }
-            // If it's an exported patch, skip it here - we'll add it in the correct position
-            // based on stack order when we encounter the right non-exported patch or at the end
         }
     }
 
